@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+# extract_fr_embs.py
+import os
+from pathlib import Path
+from math import ceil
+import argparse
+import shutil
+import cv2
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import torchvision.transforms as tvf
+
+from ai_model import iresnet200_revised
+
+
+# ---- Transforms ----
+transform = tvf.Compose([
+    tvf.ToTensor(),
+    tvf.Resize((112, 112)),
+    tvf.Normalize(0.5, 0.5),
+])
+
+def make_folder(out_root_path, remove_if_exist=False):
+    if os.path.isdir(out_root_path):
+        if remove_if_exist:
+            shutil.rmtree(out_root_path)
+            os.makedirs(out_root_path)
+    else:
+        os.makedirs(out_root_path)
+
+def l2_norm_tensor(input, axis=1):
+    norm = torch.norm(input, 2, axis, True)
+    output = torch.where(norm == 0, input, torch.div(input, norm))
+    return output
+
+
+# ---- Dataset ----
+class ImageListDataset(Dataset):
+    """
+    - input_path가 디렉토리면: 내부의 모든 jpg/jpeg/png 읽기
+    - input_path가 파일이면: 줄당 1 경로의 이미지 리스트로 간주
+    """
+    def __init__(self, input_path: str):
+        p = Path(input_path)
+        if p.is_dir():
+            exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+            self.paths = [str(fp) for fp in p.rglob("*") if fp.suffix.lower() in exts]
+            self.paths.sort()
+        else:
+            with open(p, "r") as f:
+                self.paths = [line.strip() for line in f if line.strip()]
+        assert len(self.paths) > 0, f"No images found in {input_path}"
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        fpath = self.paths[idx]
+        bgr = cv2.imread(fpath)
+        if bgr is None:
+            raise RuntimeError(f"Failed to read image: {fpath}")
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        tensor = transform(rgb)  # CxHxW, float
+        return {
+            "rgb_face_norm_tensor": tensor,
+            "jpg_path": fpath,
+            "data_index": idx   # ✅ 인덱스 추가
+        }
+
+
+# ---- Collate function ----
+def collate_fn(batch):
+    tensors = [b["rgb_face_norm_tensor"].unsqueeze(0) for b in batch]
+    paths = [b["jpg_path"] for b in batch]
+    indices = [b["data_index"] for b in batch]
+    return {
+        "rgb_face_norm_tensor": torch.cat(tensors, dim=0),  # BxCxHxW
+        "jpg_path": paths,
+        "data_index": indices
+    }
+
+
+# ---- Extractor ----
+class FR_Embedding_Extractor:
+    def __init__(self, weight_path: str):
+        print(f"[INFO] Loading model weights from: {weight_path}")
+        self.fr_encoder = iresnet200_revised()
+        self.fr_encoder.load_state_dict(torch.load(weight_path, map_location="cpu"))
+
+    def run(self, dataloader, save_path='./outs/fr_emb',
+            use_l2_norm=False, emb_dim=512, merge_embs=True, split_threshold=100*10000):
+
+        make_folder(save_path, remove_if_exist=True)
+        print(f"[INFO] Output directory prepared: {save_path}")
+
+        # 디바이스 준비
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[INFO] Using device: {device}")
+        self.fr_encoder = torch.nn.DataParallel(self.fr_encoder).to(device).eval()
+
+        embs_name = 'embs_norm' if use_l2_norm else 'embs'
+        emb_list, fpath_list, index_list = [], [], []
+
+        total_batches = len(dataloader)
+        total_images = len(dataloader.dataset)
+        print(f"[INFO] Total images: {total_images}")
+        print(f"[INFO] Batch size: {dataloader.batch_size}, Total batches: {total_batches}")
+
+        # 진행바
+        for bidx, batch in enumerate(tqdm(dataloader, desc="Extracting embeddings", unit="batch")):
+            rgb_face_norm_tensor = batch['rgb_face_norm_tensor'].to(device, non_blocking=True)
+            jpg_path_list = batch['jpg_path']
+            data_index_list = batch['data_index']
+
+            with torch.no_grad():
+                if emb_dim == 512:
+                    embs = self.fr_encoder(rgb_face_norm_tensor)
+                    if use_l2_norm:
+                        embs_norm = torch.norm(embs, p=2, dim=1, keepdim=True)
+                        embs = embs / (embs_norm + 1e-12)
+                elif emb_dim == 25600:
+                    mid_embs, final_embs = self.fr_encoder(rgb_face_norm_tensor, do_mid_val=True)
+                    final_embs = l2_norm_tensor(final_embs) if use_l2_norm else final_embs
+                    embs = torch.cat([mid_embs, final_embs], dim=1)
+                else:
+                    raise ValueError(f'emb_dim {emb_dim} is not supported')
+
+            embs = embs.detach().cpu()
+
+            if not merge_embs:
+                np.save(f'{save_path}/temp_{bidx}_{embs_name}.npy', embs.numpy())
+            else:
+                emb_list.append(embs)
+                fpath_list += jpg_path_list
+                index_list += data_index_list
+
+            del embs, rgb_face_norm_tensor
+            torch.cuda.empty_cache()
+
+        # 병합 저장
+        if merge_embs:
+            embs = torch.cat(emb_list, dim=0).numpy()
+            num_emb = embs.shape[0]
+            print(f"[INFO] Total embeddings extracted: {num_emb}")
+
+            if num_emb > split_threshold:
+                num_to_split = ceil(num_emb / split_threshold)
+                print(f"[INFO] Splitting into {num_to_split} parts (threshold={split_threshold})")
+                for i in range(num_to_split):
+                    s, e = i*split_threshold, (i+1)*split_threshold
+                    np.save(f'{save_path}/fpaths_{i}.npy', fpath_list[s:e])
+                    np.save(f'{save_path}/indices_{i}.npy', index_list[s:e])
+                    np.save(f'{save_path}/{embs_name}_{i}.npy', embs[s:e])
+            else:
+                np.save(f'{save_path}/final_fpaths.npy', fpath_list)
+                np.save(f'{save_path}/final_indices.npy', index_list)
+                np.save(f'{save_path}/final_{embs_name}.npy', embs)
+
+        print("[INFO] Extraction finished successfully.")
+
+
+# ---- Main ----
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Face Embedding Extraction Only")
+    parser.add_argument("--input", default='01_input/5M_127M_CFSC_data_list.txt',
+                        help="이미지 폴더 경로 또는 경로 리스트(txt)")
+    parser.add_argument("--output", default="./01_output/current", help="저장 폴더")
+    parser.add_argument("--weights",
+                        default="/purestorage/project/hkl/hkl_slurm/codes/ArtfaceStudio_ML/train/t2i_with_extension/weights/AVG_pruned_weight.pth",
+                        help="iresnet200_revised 가중치 파일(.pth)")
+
+    parser.add_argument("--batch_size", type=int, default=33768) #fre_batch_size=16384 
+    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--emb_dim", type=int, default=512, choices=[512, 25600])
+    parser.add_argument("--use_l2_norm", action="store_true", help="출력 임베딩 L2 정규화")
+    parser.add_argument("--no_merge_embs", action="store_true",
+                        help="배치별로 분할 저장(임시 npy) — 디버그/대용량 대응용")
+    parser.add_argument("--split_threshold", type=int, default=100*10000,
+                        help="최종 저장 시 파일 분할 임계치(기본 100만)")
+    args = parser.parse_args()
+
+    dataset = ImageListDataset(args.input)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=collate_fn,
+        drop_last=False,
+    )
+
+    extractor = FR_Embedding_Extractor(weight_path=args.weights)
+    extractor.run(
+        dataloader=dataloader,
+        save_path=args.output,
+        use_l2_norm=args.use_l2_norm,
+        emb_dim=args.emb_dim,
+        merge_embs=(not args.no_merge_embs),
+        split_threshold=args.split_threshold,
+    )
